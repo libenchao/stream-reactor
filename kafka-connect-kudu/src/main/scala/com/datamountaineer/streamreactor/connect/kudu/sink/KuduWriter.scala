@@ -58,21 +58,8 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
 
   private val MUTATION_BUFFER_SPACE = setting.mutationBufferSpace
   private lazy val kuduTablesCache = collection.mutable.Map(DbHandler.buildTableCache(setting, client).toSeq: _*)
-  private lazy val session = client.newSession()
 
-  session.setFlushMode(setting.writeFlushMode match {
-    case WriteFlushMode.SYNC =>
-      FlushMode.AUTO_FLUSH_SYNC
-    case WriteFlushMode.BATCH_SYNC =>
-      FlushMode.MANUAL_FLUSH
-    case WriteFlushMode.BATCH_BACKGROUND =>
-      FlushMode.AUTO_FLUSH_BACKGROUND
-  })
-
-  session.setMutationBufferSpace(MUTATION_BUFFER_SPACE)
-
-  //ignore duplicate in case of redelivery
-  session.isIgnoreAllDuplicateRows
+  private val resilientKuduWriter = new ResilientKuduWriter(client, setting.kcql.head)
 
   //initialize error tracker
   initialize(setting.maxRetries, setting.errorPolicy)
@@ -97,7 +84,7 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
         DbHandler.buildTableCache(setting, client)
           .map({ case (topic, table) => kuduTablesCache.put(topic, table) })
       }
-      applyInsert(records, session)
+      applyInsert(records)
     }
   }
 
@@ -105,7 +92,7 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
     * Per topic, build an new Kudu insert. Per insert build a Kudu row per SinkRecord.
     * Apply the insert per topic for the rows
     **/
-  private def applyInsert(records: Set[SinkRecord], session: KuduSession) = {
+  private def applyInsert(records: Set[SinkRecord]) = {
     def handleSinkRecord(record: SinkRecord): Upsert = {
       Option(record.valueSchema()) match {
         case None =>
@@ -135,10 +122,7 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
 
     val t = Try({
       records.iterator
-        .map(handleSinkRecord)
-        .map(session.apply)
-        .grouped(MUTATION_BUFFER_SPACE-1)
-        .foreach(_ => flush())
+        .foreach(sinkRecord => resilientKuduWriter.write(handleSinkRecord(sinkRecord), sinkRecord))
     })
     handleTry(t)
     logger.debug(s"Written ${records.size}")
@@ -225,7 +209,7 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
   def close(): Unit = {
     logger.info("Closing Kudu Session and Client")
     flush()
-    if (!session.isClosed) session.close()
+    resilientKuduWriter.close()
     client.shutdown()
   }
 
@@ -234,30 +218,5 @@ class KuduWriter(client: KuduClient, setting: KuduSettings) extends StrictLoggin
     *
     **/
   def flush(): Unit = {
-    if (!session.isClosed) {
-
-      //throw and let error policy handle it, don't want to throw RetriableException.
-      //May want to die if error policy is Throw
-      val errors : String = session.getFlushMode match {
-        case FlushMode.AUTO_FLUSH_SYNC | FlushMode.MANUAL_FLUSH =>
-          val flush = session.flush()
-          if (flush != null) {
-            flush.asScala
-              .flatMap(r => Option(r))
-              .withFilter(_.hasRowError)
-              .map(_.getRowError.toString)
-              .mkString(";")
-          } else {
-            ""
-          }
-        case FlushMode.AUTO_FLUSH_BACKGROUND =>
-          session.getPendingErrors.getRowErrors
-            .map(_.toString)
-            .mkString(";")
-      }
-      if (errors.nonEmpty) {
-        throw new RuntimeException(s"Failed to flush one or more changes:$errors")
-      }
-    }
   }
 }
